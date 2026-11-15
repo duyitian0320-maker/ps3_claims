@@ -10,6 +10,8 @@ from sklearn.metrics import auc
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
+from sklearn.metrics import make_scorer, mean_tweedie_deviance
+
 
 from ps3.data import create_sample_split, load_transform
 
@@ -23,10 +25,11 @@ weight = df["Exposure"].values
 df["PurePremium"] = df["ClaimAmountCut"] / df["Exposure"]
 y = df["PurePremium"]
 # TODO: Why do you think, we divide by exposure here to arrive at our outcome variable?
-
+# Because different insurance policies may cover different lengths of time. Dividing by exposure makes the outcomes comparable. Later, we'll use exposure as a sample weight when fitting the Tweedie model.
 
 # TODO: use your create_sample_split function here
-# df = create_sample_split(...)
+df = create_sample_split(df, id_column="IDpol", training_frac=0.8)
+
 train = np.where(df["sample"] == "train")
 test = np.where(df["sample"] == "test")
 df_train = df.iloc[train].copy()
@@ -86,16 +89,36 @@ print(
 
 # Let's put together a pipeline
 numeric_cols = ["BonusMalus", "Density"]
+
+# 1. Numeric pipeline: scaling followed by splines
+numeric_pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("splines", SplineTransformer(
+        knots="quantile",
+        include_bias=False
+    )),
+])
+
+# 2. Apply different transformations by column
 preprocessor = ColumnTransformer(
     transformers=[
         # TODO: Add numeric transforms here
+        ("num", numeric_pipeline, numeric_cols),
         ("cat", OneHotEncoder(sparse_output=False, drop="first"), categoricals),
     ]
 )
+
 preprocessor.set_output(transform="pandas")
-model_pipeline = Pipeline(
+
+# 3. Combine preprocessing and GLM
+model_pipeline = Pipeline([("preprocess", preprocessor),
     # TODO: Define pipeline steps here
-)
+    ("estimate", GeneralizedLinearRegressor(
+        family=TweedieDist,
+        l1_ratio=1,
+        fit_intercept=True
+    )),    
+])
 
 # let's have a look at the pipeline
 model_pipeline
@@ -144,6 +167,15 @@ print(
 # 1: Define the modelling pipeline. Tip: This can simply be a LGBMRegressor based on X_train_t from before.
 # 2. Make sure we are choosing the correct objective for our estimator.
 
+model_pipeline = Pipeline([
+    ("estimate", LGBMRegressor(
+        objective="tweedie",
+        tweedie_variance_power=1.5,
+        random_state=42,
+        verbosity=-1
+    ))
+])
+
 model_pipeline.fit(X_train_t, y_train_t, estimate__sample_weight=w_train_t)
 df_test["pp_t_lgbm"] = model_pipeline.predict(X_test_t)
 df_train["pp_t_lgbm"] = model_pipeline.predict(X_train_t)
@@ -171,7 +203,19 @@ print(
 # but to save compute time here, we focus on getting the learning rate
 # and the number of estimators somewhat aligned -> tune learning_rate and n_estimators
 cv = GridSearchCV(
-
+    estimator=model_pipeline,
+    param_grid={
+        "estimate__learning_rate": [0.03, 0.1],
+        "estimate__n_estimators": [100, 300],
+    },
+    scoring=make_scorer(
+        mean_tweedie_deviance,
+        greater_is_better=False,
+        power=1.5
+    ),
+    cv=3,
+    n_jobs=2,
+    verbose=2
 )
 cv.fit(X_train_t, y_train_t, estimate__sample_weight=w_train_t)
 
@@ -199,6 +243,66 @@ print(
     )
 )
 # %%
+# Optional: LightGBM frequency and severity models
+
+# 1. Frequency model (Poisson)
+y_freq = df_train["ClaimNb"] / df_train["Exposure"]
+
+freq_model = LGBMRegressor(
+    objective="poisson",
+    random_state=42,
+    verbosity=-1
+)
+
+freq_model.fit(
+    X_train_t, y_freq,
+    sample_weight=df_train["Exposure"]
+)
+
+# 2. Severity model (Gamma)
+# Only policies with positive claims
+positive = df_train["ClaimNb"] > 0
+
+y_sev = (
+    df_train.loc[positive, "ClaimAmountCut"]
+    / df_train.loc[positive, "ClaimNb"]
+)
+
+sev_model = LGBMRegressor(
+    objective="gamma",
+    random_state=42,
+    verbosity=-1
+)
+
+sev_model.fit(
+    X_train_t.loc[positive], y_sev,
+    sample_weight=df_train.loc[positive, "ClaimNb"]
+)
+
+# 3. Combine predictions
+df_train["pp_freq_sev"] = (
+    freq_model.predict(X_train_t)
+    * sev_model.predict(X_train_t)
+)
+
+df_test["pp_freq_sev"] = (
+    freq_model.predict(X_test_t)
+    * sev_model.predict(X_test_t)
+)
+
+# 4. Compare deviance
+for name, data in [
+    ("train", df_train),
+    ("test", df_test)
+]:
+    loss = TweedieDist.deviance(
+        data["PurePremium"],
+        data["pp_freq_sev"],
+        sample_weight=data["Exposure"]
+    ) / data["Exposure"].sum()
+
+    print(f"{name} deviance: {loss:.4f}")
+# %%
 # Let's compare the sorting of the pure premium predictions
 
 
@@ -223,6 +327,7 @@ for label, y_pred in [
     ("LGBM", df_test["pp_t_lgbm"]),
     ("GLM Benchmark", df_test["pp_t_glm1"]),
     ("GLM Splines", df_test["pp_t_glm2"]),
+    ("LGBM Frequency-Severity", df_test["pp_freq_sev"]),
 ]:
     ordered_samples, cum_claims = lorenz_curve(
         df_test["PurePremium"], y_pred, df_test["Exposure"]
@@ -250,3 +355,13 @@ ax.legend(loc="upper left")
 plt.plot()
 
 # %%
+
+
+# Conclusion:
+# Adding splines improves the benchmark GLM's predictive performance.
+# LightGBM further reduces test deviance, especially after tuning.
+# The optional frequency-severity LightGBM achieves the lowest
+# test deviance (73.2263), outperforming the tuned Tweedie
+# LightGBM (73.3544).
+# However, its larger train-test gap suggests some remaining
+# overfitting. Further tuning could improve generalisation.
