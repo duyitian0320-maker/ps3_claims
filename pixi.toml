@@ -1,0 +1,26 @@
+[workspace]
+authors = ["Yitian Du <YOUR_GITHUB_EMAILduyitian0320@gmail.com>"]
+channels = ["conda-forge"]
+name = "ps3_claims"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.12.*"
+pip = ">=26.2.2,<27"
+pytest = ">=9.2.0,<10"
+pytest-cov = ">=7.1.0,<8"
+numpy = ">=2.5.4,<3"
+pandas = ">=2.2,<3"
+scikit-learn = ">=1.9.1,<2"
+matplotlib = ">=3.11.2,<4"
+ipykernel = ">=7.4.0,<8"
+dask-ml = ">=2025.1.0,<2026"
+glum = ">=3.4.1,<4"
+lightgbm = ">=4.7.0,<5"
+
+[pypi-dependencies]
+dalex = ">=1.8.0"
+nbformat = ">=5.11.1, <6"
